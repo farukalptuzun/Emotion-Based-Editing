@@ -41,8 +41,17 @@ class TextEmotionDetector:
             "sadness": "sadness"
         }
         
-        # Device
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # Device - Metal Performance Shaders (MPS) for Mac, CUDA for NVIDIA, CPU fallback
+        if torch.backends.mps.is_available():
+            self.device = "mps"
+            print("Using Metal Performance Shaders (MPS) for acceleration")
+        elif torch.cuda.is_available():
+            self.device = "cuda"
+            print("Using CUDA for acceleration")
+        else:
+            self.device = "cpu"
+            print("Using CPU (no GPU acceleration available)")
+        
         self.emotion_model.to(self.device)
         self.emotion_model.eval()
     
