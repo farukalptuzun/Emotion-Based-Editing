@@ -386,7 +386,8 @@ class VideoProcessor:
             cmd = [
                 "ffmpeg", "-i", input_path,
                 "-filter_complex", filter_complex,
-                "-map", "[outv]",  # Concat output'unu map et
+                "-map", "[outv]",  # Concat output'unu map et (video)
+                "-map", "0:a",  # Audio stream'i de map et (SES İÇİN GEREKLİ!)
                 "-c:v", "libx264",  # Software encoder (daha stabil)
                 "-preset", "ultrafast",  # En hızlı encoding
                 "-crf", "28",  # Quality (18-28 arası, 28 = hızlı encoding, kabul edilebilir kalite)
