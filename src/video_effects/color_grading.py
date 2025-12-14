@@ -55,12 +55,13 @@ class ColorGradingProcessor:
                 "playful_overlay": True  # Playful overlay (subtle color shift)
             },
             EmotionColorStyle.SADNESS: {
-                "saturation": 0.6,  # Desaturation
-                "contrast": 0.9,
-                "brightness": 0.9,
-                "warmth": 0.95,
+                "saturation": 0.5,  # Daha soluk (desaturation)
+                "contrast": 0.85,  # Daha düşük kontrast
+                "brightness": 0.85,  # Daha karanlık
+                "warmth": 0.80,  # Daha soğuk tonlar (blue/cyan shift)
                 "vignette": True,  # Vignette effect
-                "vignette_intensity": 0.3
+                "vignette_intensity": 0.5,  # Daha belirgin vignette
+                "blue_tint": True  # Blue/cyan tint ekle
             },
             EmotionColorStyle.NEUTRAL: {
                 "saturation": 1.0,
@@ -146,12 +147,13 @@ class ColorGradingProcessor:
         # Zaman sırasına göre sırala
         sorted_segments = sorted(color_segments, key=lambda x: x['start'])
         
-        # Style priority: excitement/humor > tension > sadness > neutral
+        # Style priority: excitement/humor > tension/sadness > neutral
+        # Sadness priority artırıldı (tension ile aynı seviye)
         style_priority = {
             EmotionColorStyle.EXCITEMENT: 4,
             EmotionColorStyle.HUMOR: 4,
             EmotionColorStyle.TENSION: 3,
-            EmotionColorStyle.SADNESS: 2,
+            EmotionColorStyle.SADNESS: 3,  # Increased from 2 to 3 (same as tension)
             EmotionColorStyle.NEUTRAL: 1
         }
         
@@ -183,22 +185,38 @@ class ColorGradingProcessor:
                 # Hiç segment yok, neutral
                 style = EmotionColorStyle.NEUTRAL
             else:
-                # En yüksek priority'ye sahip style'ı seç
-                best_seg = max(active_segments, 
-                              key=lambda s: style_priority.get(s['style'], 0))
-                style = best_seg['style']
+                # Neutral olmayan segment'leri tercih et
+                # Eğer başka bir emotion varsa, neutral'ı ignore et
+                non_neutral = [s for s in active_segments 
+                              if s['style'] != EmotionColorStyle.NEUTRAL]
+                
+                if non_neutral:
+                    # Neutral olmayan segment varsa, en yüksek priority'ye sahip olanı seç
+                    best_seg = max(non_neutral, 
+                                  key=lambda s: style_priority.get(s['style'], 0))
+                    style = best_seg['style']
+                else:
+                    # Sadece neutral varsa, neutral kullan
+                    style = EmotionColorStyle.NEUTRAL
             
             # Eğer önceki segment ile aynı style ise birleştir
             if merged and merged[-1]['style'] == style:
                 merged[-1]['end'] = end_time
             else:
                 # Yeni segment oluştur
-                merged.append({
-                    "start": start_time,
-                    "end": end_time,
-                    "style": style,
-                    "params": self.grading_params[style]
-                })
+                # Çok kısa segment'leri de koru (sadness gibi non-neutral için önemli)
+                segment_duration = end_time - start_time
+                min_duration = 0.1  # Minimum 0.1 saniye
+                
+                # Non-neutral segment'leri her zaman ekle (ne kadar kısa olursa olsun)
+                # Neutral segment'ler için minimum duration kontrolü yap
+                if segment_duration >= min_duration or style != EmotionColorStyle.NEUTRAL:
+                    merged.append({
+                        "start": start_time,
+                        "end": end_time,
+                        "style": style,
+                        "params": self.grading_params[style]
+                    })
         
         return merged
     
@@ -209,7 +227,7 @@ class ColorGradingProcessor:
                             height: int) -> str:
         """
         FFmpeg color grading filter string'i oluştur
-        TESTING: Only saturation enabled to identify white screen issue
+        Using curves filter for warmth and brightness (YUV compatible)
         """
         filters = []
         
@@ -223,22 +241,69 @@ class ColorGradingProcessor:
         if contrast != 1.0:
             filters.append(f"eq=contrast={contrast:.2f}")
         
-        # Brightness - DISABLED (causes white screen with eq filter)
-        # Using contrast to simulate brightness effect instead
-        # brightness = params.get("brightness", 1.0)
-        # if brightness != 1.0:
-        #     filters.append(f"eq=brightness={brightness:.2f}")
+        # Warmth (color temperature) - Using curves filter (YUV compatible)
+        warmth = params.get("warmth", 1.0)
+        if warmth != 1.0:
+            # Warm tones: increase red, decrease blue
+            # Cold tones: increase blue, decrease red
+            # curves filter: all=master, r=red, g=green, b=blue
+            if warmth > 1.0:
+                # Warm: boost red channel, reduce blue channel
+                warm_boost = (warmth - 1.0) * 0.15  # Scale to 0-0.15 range
+                # Red channel: slight boost in midtones
+                # Blue channel: slight reduction in midtones
+                filters.append(f"curves=all='0/0 0.5/0.5 1/1':r='0/0 0.5/{0.5+warm_boost:.3f} 1/1':b='0/0 0.5/{0.5-warm_boost:.3f} 1/1'")
+            else:
+                # Cold: boost blue channel, reduce red channel
+                cold_boost = (1.0 - warmth) * 0.15
+                filters.append(f"curves=all='0/0 0.5/0.5 1/1':r='0/0 0.5/{0.5-cold_boost:.3f} 1/1':b='0/0 0.5/{0.5+cold_boost:.3f} 1/1'")
         
-        # Warmth - DISABLED (already known to cause issues)
-        # warmth = params.get("warmth", 1.0)
-        # if warmth != 1.0:
-        #     pass
+        # Vibrance - Using saturation boost (vibrance filter not available in FFmpeg)
+        # Vibrance preserves skin tones while boosting other colors
+        # For now, using additional saturation as approximation
+        vibrance = params.get("vibrance", 1.0)
+        if vibrance != 1.0 and abs(vibrance - sat) > 0.05:  # Only if different from saturation
+            # Apply vibrance as additional saturation boost
+            vibrance_boost = vibrance
+            filters.append(f"eq=saturation={vibrance_boost:.2f}")
+        
+        # Brightness - Using curves filter (alternative to eq=brightness)
+        brightness = params.get("brightness", 1.0)
+        if brightness != 1.0:
+            # Brightness adjustment using curves (YUV compatible)
+            # Lift all channels by brightness amount
+            if brightness > 1.0:
+                # Increase brightness: lift shadows and midtones
+                bright_lift = (brightness - 1.0) * 0.15  # Scale to reasonable range
+                filters.append(f"curves=all='0/{bright_lift:.3f} 0.5/{0.5+bright_lift:.3f} 1/1'")
+            else:
+                # Decrease brightness: lower shadows and midtones
+                dark_lift = (1.0 - brightness) * 0.15
+                filters.append(f"curves=all='0/{dark_lift:.3f} 0.5/{0.5-dark_lift:.3f} 1/1'")
+        
+        # Blue tint - ENABLED (for sadness style, additional blue/cyan shift)
+        if params.get("blue_tint", False):
+            # Additional blue/cyan tint for sadness (beyond warmth adjustment)
+            # Boost blue channel slightly, reduce red channel
+            filters.append(f"curves=all='0/0 0.5/0.5 1/1':r='0/0 0.5/0.48 1/1':b='0/0 0.5/0.52 1/1'")
         
         # Vignette - ENABLED (for sadness style)
         if params.get("vignette", False):
             intensity = params.get("vignette_intensity", 0.3)
             # Vignette: darken edges
-            filters.append(f"vignette=angle=PI/4:startx=0.5:starty=0.5:stopx=0.5:stopy=0.5")
+            # FFmpeg vignette parameters: angle, x0, y0, mode
+            # x0, y0: center coordinates (0-1 range, 0.5 = center)
+            # angle: vignette angle (smaller angle = more intense/darker vignette)
+            # mode: 0=black vignette, 1=white vignette
+            # Intensity kontrolü için angle'i ayarla
+            # intensity 0.3 -> PI/4 (less intense), intensity 0.5 -> PI/6 (more intense)
+            if intensity <= 0.3:
+                vignette_angle = "PI/4"  # Default, less intense
+            elif intensity <= 0.4:
+                vignette_angle = "PI/5"  # Medium intensity
+            else:
+                vignette_angle = "PI/6"  # High intensity (0.5)
+            filters.append(f"vignette=angle={vignette_angle}:x0=0.5:y0=0.5:mode=0")
         
         # Playful overlay - ENABLED (for humor style)
         if params.get("playful_overlay", False):
@@ -349,6 +414,23 @@ class ColorGradingProcessor:
             duration = style_durations[style]
             percentage = (duration / sum(style_durations.values())) * 100 if sum(style_durations.values()) > 0 else 0
             print(f"  {style}: {count} segments, {duration:.2f}s ({percentage:.1f}%)")
+        
+        # Sadness segment'lerini özellikle kontrol et
+        sadness_segments = [s for s in merged_segments if s['style'] == EmotionColorStyle.SADNESS]
+        if sadness_segments:
+            print(f"\n😢 SADNESS SEGMENTS DETECTED: {len(sadness_segments)}")
+            for seg in sadness_segments:
+                duration = seg['end'] - seg['start']
+                print(f"   {seg['start']:.2f}s - {seg['end']:.2f}s (duration: {duration:.2f}s)")
+                print(f"      Params: saturation={seg['params'].get('saturation', 1.0):.2f}, "
+                      f"contrast={seg['params'].get('contrast', 1.0):.2f}, "
+                      f"vignette={seg['params'].get('vignette', False)}")
+        else:
+            print(f"\n⚠️  NO SADNESS SEGMENTS FOUND in merged segments")
+            # Original timeline'da sadness var mı kontrol et
+            original_sadness = [s for s in merged_segments if 'sadness' in str(s.get('style', '')).lower()]
+            if original_sadness:
+                print(f"   (But sadness was detected in original timeline - check merge logic)")
         
         print(f"{'='*60}\n")
         

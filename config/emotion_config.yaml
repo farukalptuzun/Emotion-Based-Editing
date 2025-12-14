@@ -1,0 +1,43 @@
+# EB-3: Emotion-Based Color Grading Configuration
+
+emotion_color_mapping:
+  excitement:
+    saturation: 1.3
+    contrast: 1.1
+    brightness: 1.05
+    warmth: 1.15  # Warm tones (red/orange shift)
+    vibrance: 1.2
+  
+  tension:  # anger → tension
+    saturation: 0.95
+    contrast: 1.4  # ↑ Contrast
+    brightness: 0.95
+    warmth: 0.85  # Cold tones (blue/cyan shift)
+    vibrance: 0.9
+  
+  humor:
+    saturation: 1.1
+    contrast: 1.05
+    brightness: 1.08
+    warmth: 1.1
+    vibrance: 1.15
+    playful_overlay: true
+  
+  sadness:
+    saturation: 0.6  # Desaturation
+    contrast: 0.9
+    brightness: 0.9
+    warmth: 0.95
+    vignette: true
+    vignette_intensity: 0.3
+  
+  neutral:
+    saturation: 1.0
+    contrast: 1.0
+    brightness: 1.0
+    warmth: 1.0
+
+humor_detection:
+  emotion: "excitement"
+  max_energy: 0.3  # Low energy excitement → humor
+

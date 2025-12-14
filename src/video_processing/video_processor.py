@@ -126,7 +126,7 @@ class VideoProcessor:
         Segment bazlı dinamik zoom:
         - Yüksek enerji → zoom in (yakınlaşma)
         - Düşük enerji → zoom out (uzaklaşma)
-        - Timeline'daki her segment için farklı zoom faktörü
+        - zoom_segments kullanılır (ZoomEffectCalculator tarafından energy_threshold: 0.75 ile hesaplanmış)
         """
         if not timeline:
             return ""  # Timeline yok
@@ -135,48 +135,58 @@ class VideoProcessor:
         height = video_info['height']
         fps = video_info['fps']
         
-        # Timeline'daki TÜM segmentler için zoom faktörü hesapla
-        # ÖNEMLİ: Energy değerlerini normalize et (JSON'daki energy 0.0-0.55 arası olabilir)
-        # Önce max energy'yi bul
-        all_energies = [seg.get("energy", 0.0) for seg in timeline]
-        max_energy = max(all_energies) if all_energies else 1.0
-        min_energy = min(all_energies) if all_energies else 0.0
-        energy_range = max_energy - min_energy if max_energy > min_energy else 1.0
-        
-        print(f"Energy range in timeline: {min_energy:.2f} - {max_energy:.2f}")
-        
-        segment_zooms = []
-        
-        for segment in timeline:
-            energy = segment.get("energy", 0.0)
-            start_time = segment["start"]
-            end_time = segment["end"]
+        # zoom_segments kullan (ZoomEffectCalculator tarafından hesaplanmış)
+        # Eğer zoom_segments boşsa, timeline'dan zoom hesapla (fallback)
+        if zoom_segments:
+            print(f"Using {len(zoom_segments)} zoom segments from ZoomEffectCalculator (energy_threshold: 0.75)")
+            segment_zooms = []
+            for seg in zoom_segments:
+                segment_zooms.append({
+                    "start": seg.get("start", 0.0),
+                    "end": seg.get("end", 0.0),
+                    "zoom": seg.get("zoom_factor", 1.0),  # zoom_segments'te zoom_factor var
+                    "energy": seg.get("energy", 0.0),
+                    "crop_x": seg.get("crop_x"),  # Face tracking'den gelen crop koordinatları
+                    "crop_y": seg.get("crop_y")
+                })
+        else:
+            # Fallback: Eğer zoom_segments yoksa, timeline'dan hesapla
+            print("⚠️  No zoom_segments found, calculating from timeline (fallback)")
+            all_energies = [seg.get("energy", 0.0) for seg in timeline]
+            max_energy = max(all_energies) if all_energies else 1.0
+            min_energy = min(all_energies) if all_energies else 0.0
+            energy_range = max_energy - min_energy if max_energy > min_energy else 1.0
             
-            # Energy'yi normalize et (0.0-1.0 aralığına)
-            if energy_range > 0:
-                normalized_energy = (energy - min_energy) / energy_range
-            else:
-                normalized_energy = 0.0
+            print(f"Energy range in timeline: {min_energy:.2f} - {max_energy:.2f}")
             
-            # Normalize edilmiş energy'ye göre zoom faktörü hesapla
-            # Düşük enerji (0.0-0.3) → zoom out (0.95) - daha görünür uzaklaşma
-            # Orta enerji (0.3-0.6) → zoom 1.0-1.15 - daha görünür zoom
-            # Yüksek enerji (0.6-1.0) → zoom 1.15-1.25 - çok daha görünür zoom
-            if normalized_energy < 0.3:
-                zoom_factor = 0.95  # Zoom out (uzaklaşma) - %5 zoom out
-            elif normalized_energy < 0.6:
-                # Orta enerji: 0.3-0.6 → zoom 1.0-1.15
-                zoom_factor = 1.0 + (normalized_energy - 0.3) * 0.5  # 0.0-0.15 range
-            else:
-                # Yüksek enerji: 0.6-1.0 → zoom 1.15-1.25
-                zoom_factor = 1.15 + (normalized_energy - 0.6) * 0.25  # 0.15-0.25 range
-            
-            segment_zooms.append({
-                "start": start_time,
-                "end": end_time,
-                "zoom": zoom_factor,
-                "energy": energy
-            })
+            segment_zooms = []
+            for segment in timeline:
+                energy = segment.get("energy", 0.0)
+                start_time = segment["start"]
+                end_time = segment["end"]
+                
+                # Energy'yi normalize et (0.0-1.0 aralığına)
+                if energy_range > 0:
+                    normalized_energy = (energy - min_energy) / energy_range
+                else:
+                    normalized_energy = 0.0
+                
+                # Normalize edilmiş energy'ye göre zoom faktörü hesapla
+                if normalized_energy < 0.3:
+                    zoom_factor = 0.95
+                elif normalized_energy < 0.6:
+                    zoom_factor = 1.0 + (normalized_energy - 0.3) * 0.5
+                else:
+                    zoom_factor = 1.15 + (normalized_energy - 0.6) * 0.25
+                
+                segment_zooms.append({
+                    "start": start_time,
+                    "end": end_time,
+                    "zoom": zoom_factor,
+                    "energy": energy,
+                    "crop_x": None,
+                    "crop_y": None
+                })
         
         # FFmpeg expression oluştur: segment bazlı zoom
         # Format: if(between(t,start,end),zoom_factor,if(between(t,start2,end2),zoom_factor2,...))
@@ -266,6 +276,8 @@ class VideoProcessor:
             seg_start = seg['start']
             seg_end = seg['end']
             seg_zoom = seg['zoom']
+            seg_crop_x = seg.get('crop_x')  # Face tracking'den gelen crop koordinatları
+            seg_crop_y = seg.get('crop_y')
             
             # Eğer current_time ile seg_start arasında boşluk varsa, default zoom segment'i ekle
             if current_time < seg_start:
@@ -273,15 +285,19 @@ class VideoProcessor:
                     'start': current_time,
                     'end': seg_start,
                     'zoom': default_zoom,
-                    'type': 'default'
+                    'type': 'default',
+                    'crop_x': None,
+                    'crop_y': None
                 })
             
-            # Zoom segment'ini ekle
+            # Zoom segment'ini ekle (crop koordinatları ile birlikte)
             all_segments.append({
                 'start': seg_start,
                 'end': seg_end,
                 'zoom': seg_zoom,
-                'type': 'zoom'
+                'type': 'zoom',
+                'crop_x': seg_crop_x,  # Face tracking koordinatları
+                'crop_y': seg_crop_y
             })
             
             current_time = seg_end
@@ -292,7 +308,9 @@ class VideoProcessor:
                 'start': current_time,
                 'end': video_duration,
                 'zoom': default_zoom,
-                'type': 'default'
+                'type': 'default',
+                'crop_x': None,
+                'crop_y': None
             })
         
         # Segment sayısını sınırla (çok fazla segment filter'ı çok uzun yapar)
@@ -317,12 +335,56 @@ class VideoProcessor:
             seg_start = seg['start']
             seg_end = seg['end']
             seg_zoom = seg['zoom']
+            seg_crop_x = seg.get('crop_x')  # Face tracking'den gelen crop koordinatları
+            seg_crop_y = seg.get('crop_y')
             
             # Crop koordinatlarını hesapla
-            crop_w = int(width / seg_zoom)
-            crop_h = int(height / seg_zoom)
-            crop_x = int((width - crop_w) / 2)
-            crop_y = int((height - crop_h) / 2)
+            # Zoom faktörü kontrolü: zoom < 1.0 = zoom out, zoom > 1.0 = zoom in
+            if seg_zoom < 1.0:
+                # Zoom out: crop boyutları video boyutundan küçük olmalı
+                crop_w = int(width * seg_zoom)
+                crop_h = int(height * seg_zoom)
+            elif seg_zoom > 1.0:
+                # Zoom in: crop boyutları video boyutundan küçük olmalı
+                crop_w = int(width / seg_zoom)
+                crop_h = int(height / seg_zoom)
+            else:
+                # Zoom = 1.0: no crop needed, use full frame
+                crop_w = width
+                crop_h = height
+            
+            # Crop boyutlarını video sınırları içinde tut (güvenlik kontrolü)
+            crop_w = max(1, min(crop_w, width))
+            crop_h = max(1, min(crop_h, height))
+            
+            # Crop koordinatlarını hesapla
+            # Eğer face tracking'den crop koordinatları varsa, onları kullan
+            if seg_crop_x is not None and seg_crop_y is not None:
+                # Face tracking'den gelen koordinatları kullan
+                crop_x = int(seg_crop_x - crop_w / 2)
+                crop_y = int(seg_crop_y - crop_h / 2)
+            else:
+                # Face tracking yoksa, merkezden crop yap
+                crop_x = int((width - crop_w) / 2)
+                crop_y = int((height - crop_h) / 2)
+            
+            # Koordinatları sınırlar içinde tut (güvenlik kontrolü)
+            crop_x = max(0, min(crop_x, width - crop_w))
+            crop_y = max(0, min(crop_y, height - crop_h))
+            
+            # Final validation: crop_x + crop_w <= width, crop_y + crop_h <= height
+            if crop_x + crop_w > width:
+                crop_x = max(0, width - crop_w)
+            if crop_y + crop_h > height:
+                crop_y = max(0, height - crop_h)
+            
+            # Ensure crop dimensions are valid
+            if crop_w <= 0 or crop_h <= 0:
+                # Fallback: use full frame
+                crop_w = width
+                crop_h = height
+                crop_x = 0
+                crop_y = 0
             
             # Output label
             output_label = f"v{i}"
