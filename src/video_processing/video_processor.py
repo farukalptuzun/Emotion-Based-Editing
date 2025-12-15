@@ -17,11 +17,27 @@ class VideoProcessor:
     
     def __init__(self,
                  energy_threshold: float = 0.75,
-                 face_sample_rate: float = 1.0):  # Default: Her 1 saniyede bir frame (hız/doğruluk dengesi)
+                 face_sample_rate: float = 1.0,  # Default: Her 1 saniyede bir frame (hız/doğruluk dengesi)
+                 enable_transitions: bool = True,
+                 transition_duration: float = 0.25,
+                 transition_types: Optional[list] = None,  # EB-4: Transition Optimizer
+                 max_transitions: int = 4,
+                 min_seg_for_transition: float = 2.5,
+                 min_zoom_delta: float = 0.08):
         # Lazy load: FaceTracker'ı sadece gerektiğinde yükle (MediaPipe yüklemesi yavaş olabilir)
         self._face_sample_rate = face_sample_rate
         self._face_tracker = None
         self.zoom_calculator = ZoomEffectCalculator(energy_threshold=energy_threshold)
+        # EB-4 config
+        self.enable_transitions = enable_transitions
+        self.transition_duration = transition_duration
+        self.max_transitions = max_transitions
+        self.min_seg_for_transition = min_seg_for_transition
+        self.min_zoom_delta = min_zoom_delta
+        # Fade + blur + zoom karması (TikTok jump-cut vibe için)
+        # FFmpeg xfade'ın desteklediği geçişler: fade, wipe*, slide*, dissolve, radial, etc.
+        # Blur/zoom transition bu build'de yok; fallback olarak sadece fade kullan.
+        self.transition_types = transition_types or ["fade"]
     
     @property
     def face_tracker(self):
@@ -330,11 +346,15 @@ class VideoProcessor:
         # Her segment için trim + crop + scale filter'ı oluştur
         filter_parts = []
         output_labels = []
+        segment_durations = []  # Duration of each output label
+        
+        vid_fps = video_info.get('fps', 30)
         
         for i, seg in enumerate(all_segments):
             seg_start = seg['start']
             seg_end = seg['end']
             seg_zoom = seg['zoom']
+            seg_duration = max(0.0, seg_end - seg_start)
             seg_crop_x = seg.get('crop_x')  # Face tracking'den gelen crop koordinatları
             seg_crop_y = seg.get('crop_y')
             
@@ -389,27 +409,112 @@ class VideoProcessor:
             # Output label
             output_label = f"v{i}"
             output_labels.append(output_label)
+            segment_durations.append(seg_duration)
             
             # Filter: trim + setpts + crop + scale
             filter_part = (
                 f"[0:v]trim=start={seg_start:.3f}:end={seg_end:.3f},"
                 f"setpts=PTS-STARTPTS,"
+                f"settb=1/600,"  # normalize timebase to a common base (match source tbn 600)
                 f"crop={crop_w}:{crop_h}:{crop_x}:{crop_y},"
                 f"scale={width}:{height}:flags=lanczos[{output_label}]"
             )
             filter_parts.append(filter_part)
         
-        # Concat filter: Tüm segment'leri birleştir
-        concat_inputs = "".join([f"[{label}]" for label in output_labels])
-        concat_filter = f"{concat_inputs}concat=n={len(output_labels)}:v=1[outv]"
+        # EB-4: Transition Optimizer (xfade chain) - optional
+        transition_parts = []
+        final_label = None
+        # Dinamik geçiş limiti: segment ve süreye göre ölçekle
+        total_duration = sum(segment_durations) if segment_durations else 0
+        dynamic_max_trans = self.max_transitions
+        dynamic_max_trans = min(dynamic_max_trans, max(1, len(all_segments) // 3))
+        if total_duration < 12:
+            dynamic_max_trans = min(dynamic_max_trans, 1)
+        elif total_duration < 20:
+            dynamic_max_trans = min(dynamic_max_trans, 2)
+        if self.enable_transitions and len(output_labels) > 1:
+            transition_types = self.transition_types or ["fade"]
+            current_label = output_labels[0]
+            current_duration = segment_durations[0]
+            transitions_used = 0
+            
+            for idx in range(1, len(output_labels)):
+                next_label = output_labels[idx]
+                next_duration = segment_durations[idx]
+                prev_zoom = all_segments[idx-1]['zoom']
+                next_zoom = all_segments[idx]['zoom']
+                
+                # Koşullar: limit, segment süresi, zoom farkı
+                use_transition = True
+                if transitions_used >= dynamic_max_trans:
+                    use_transition = False
+                adaptive_min_seg = max(self.min_seg_for_transition, total_duration * 0.04)
+                if current_duration < adaptive_min_seg or next_duration < adaptive_min_seg:
+                    use_transition = False
+                if abs(prev_zoom - next_zoom) < self.min_zoom_delta:
+                    use_transition = False
+                
+                trans_type = transition_types[(transitions_used) % len(transition_types)]
+                
+                # Transition duration: clamp to both segments (max 40% of shorter segment)
+                base_dur = self.transition_duration
+                max_allowed = min(current_duration, next_duration) * 0.4
+                trans_dur = min(base_dur, max_allowed) if max_allowed > 0 else base_dur
+                if trans_dur <= 0:
+                    trans_dur = base_dur
+                
+                out_label = None
+                if use_transition:
+                    # Non-overlapping fade out + fade in + concat to avoid shortening total duration
+                    offset = max(current_duration - trans_dur, 0)
+                    out_label = f"x{transitions_used+1}"
+                    # Fade out current
+                    transition_parts.append(
+                        f"[{current_label}]fade=t=out:st={offset:.3f}:d={trans_dur:.3f}[{current_label}fout]"
+                    )
+                    # Fade in next
+                    transition_parts.append(
+                        f"[{next_label}]fade=t=in:st=0:d={trans_dur:.3f}[{next_label}fin]"
+                    )
+                    # Concat without overlap
+                    transition_parts.append(
+                        f"[{current_label}fout][{next_label}fin]concat=n=2:v=1:a=0,settb=1/600[{out_label}]"
+                    )
+                    transitions_used += 1
+                    # Duration sums without subtraction (no overlap)
+                    current_duration = current_duration + next_duration
+                    current_label = out_label
+                else:
+                    # Transition yok: concat benzeri, süreyi topla, label'ı değiştir
+                    out_label = f"x{idx}"
+                    transition_parts.append(
+                        f"[{current_label}][{next_label}]concat=n=2:v=1:a=0,settb=1/600[{out_label}]"
+                    )
+                    current_duration = current_duration + next_duration
+                    current_label = out_label
+            
+            final_label = current_label
+        else:
+            # Concat fallback (no transitions)
+            concat_inputs = "".join([f"[{label}]" for label in output_labels])
+            concat_filter = f"{concat_inputs}concat=n={len(output_labels)}:v=1,settb=1/600[outv]"
+            transition_parts.append(concat_filter)
+            final_label = "outv"
         
         # Tüm filter'ları birleştir
-        filter_str = ";".join(filter_parts) + ";" + concat_filter
+        filter_str_parts = filter_parts + transition_parts
+        if final_label and final_label != "outv":
+            filter_str_parts.append(f"[{final_label}]settb=1/600[outv]")
+        filter_str = ";".join(filter_str_parts)
         
         zoom_range = [seg["zoom"] for seg in merged_segments]
         print(f"Segment-based dynamic zoom: {len(all_segments)} segments (merged from {len(segment_zooms)} original)")
         print(f"Zoom range: {min(zoom_range):.2f} - {max(zoom_range):.2f}")
-        print(f"Using trim+crop+scale+concat approach with {len(all_segments)} segments")
+        if self.enable_transitions and len(output_labels) > 1:
+            print(f"EB-4 Transitions enabled: {len(transition_parts)} transitions (max {self.max_transitions}), types={self.transition_types}, base duration={self.transition_duration}s")
+        else:
+            print(f"EB-4 Transitions disabled or single segment; using concat")
+        print(f"Using trim+crop+scale + transitions/concat with {len(all_segments)} segments")
         print(f"Energy-based: Low energy → zoom out (0.95), High energy → zoom in (1.25)")
         
         # Debug: Filter string uzunluğunu kontrol et
@@ -454,7 +559,11 @@ class VideoProcessor:
                 "-preset", "ultrafast",  # En hızlı encoding
                 "-crf", "28",  # Quality (18-28 arası, 28 = hızlı encoding, kabul edilebilir kalite)
                 "-threads", "0",  # Tüm CPU core'ları kullan
-                "-c:a", "copy",
+                "-c:a", "aac",
+                "-b:a", "128k",
+                "-video_track_timescale", "600",  # normalize output track timescale
+                "-af", "asetpts=PTS-STARTPTS",  # audio PTS normalize (pad kaldırıldı)
+                "-shortest",  # keep audio/video in sync; cut audio if longer
                 output_path, "-y"
             ]
         
